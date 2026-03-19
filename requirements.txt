@@ -23,3 +23,7 @@ librosa
 openai-whisper==20231117
 pre-commit==3.5.0
 langid
+numpy<2
+soundfile==0.13.1
+pandas==2.3.3
+datasets<2.20.0
