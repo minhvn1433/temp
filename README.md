@@ -71,6 +71,7 @@ conda install conda-forge::sox
 - Install torch and torchaudio, It's recomended to use 2.2.2+cu121:
 
 ``` sh
+conda install -c nvidia cuda-toolkit=12.1 -y
 pip install torch==2.2.2+cu121 torchaudio==2.2.2+cu121 -f https://download.pytorch.org/whl/torch_stable.html
 ```
 

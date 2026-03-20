@@ -49,3 +49,9 @@ compile_commands.json
 
 # others
 examples/ascend/s0/exp/
+examples/ascend/s0/data/
+examples/ascend/s0/downloads/
+examples/ascend/s0/storage/
+examples/ascend/s0/datastore/
+examples/ascend/s0/log/
+examples/ascend/s0/tensorboard/

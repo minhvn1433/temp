@@ -1,8 +1,65 @@
-accum_grad: 1
-cmvn_file: exp/20220506_u2pp_conformer_exp_wenetspeech/global_cmvn
+# network architecture
+# encoder related
+encoder: conformer
+encoder_conf:
+  output_size: 512 # dimension of attention # NOTE: different from 20210601_u2++_conformer_exp
+  attention_heads: 8 # NOTE: different from 20210601_u2++_conformer_exp
+  linear_units: 2048 # the number of units of position-wise feed forward
+  num_blocks: 12 # the number of encoder blocks
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  attention_dropout_rate: 0.1
+  input_layer: conv2d # encoder input type
+  normalize_before: true
+  cnn_module_kernel: 15 # NOTE: different from 20210601_u2++_conformer_exp
+  use_cnn_module: true
+  activation_type: 'swish'
+  causal: true
+  use_dynamic_chunk: true
+  cnn_module_norm: 'layer_norm' # using nn.LayerNorm makes model converge faster
+  use_dynamic_left_chunk: false
+
+  pos_enc_layer_type: rel_pos
+  selfattention_layer_type: rel_selfattn
+
+# decoder related
+decoder: bitransformer
+decoder_conf:
+  attention_heads: 4
+  linear_units: 2048
+  num_blocks: 3
+  r_num_blocks: 3
+  dropout_rate: 0.1
+  positional_dropout_rate: 0.1
+  self_attention_dropout_rate: 0.1
+  src_attention_dropout_rate: 0.1
+
+tokenizer: char
+tokenizer_conf:
+  symbol_table_path: exp/20220506_u2pp_conformer_exp_wenetspeech/units.txt
+  split_with_space: false
+  non_lang_syms_path: null
+
+ctc: ctc
+ctc_conf:
+  ctc_blank_id: 0
+
+cmvn: global_cmvn
+cmvn_conf:
+  cmvn_file: data/train/global_cmvn
+  is_json_cmvn: true
+
+model: asr_model
+model_conf:
+  ctc_weight: 0.3
+  length_normalized_loss: false
+  lsm_weight: 0.1
+  reverse_weight: 0.3
+
+dataset: asr
 dataset_conf:
   filter_conf:
-    max_length: 40960
+    max_length: 4096
     min_length: 0
     token_max_length: 200
     token_min_length: 1
@@ -29,50 +86,19 @@ dataset_conf:
   batch_conf:
     batch_type: 'static' # static or dynamic
     batch_size: 16
-decoder: bitransformer
-decoder_conf:
-  attention_heads: 4
-  dropout_rate: 0.1
-  linear_units: 2048
-  num_blocks: 3
-  positional_dropout_rate: 0.1
-  r_num_blocks: 3
-  self_attention_dropout_rate: 0.1
-  src_attention_dropout_rate: 0.1
-encoder: conformer
-encoder_conf:
-  activation_type: swish
-  attention_dropout_rate: 0.1
-  attention_heads: 4
-  causal: true
-  cnn_module_kernel: 8
-  cnn_module_norm: layer_norm
-  dropout_rate: 0.1
-  input_layer: conv2d
-  linear_units: 2048
-  normalize_before: true
-  num_blocks: 12
-  output_size: 256
-  pos_enc_layer_type: rel_pos
-  positional_dropout_rate: 0.1
-  selfattention_layer_type: rel_selfattn
-  use_cnn_module: true
-  use_dynamic_chunk: true
-  use_dynamic_left_chunk: false
+
 grad_clip: 5
+accum_grad: 1
+max_epoch: 20
+log_interval: 1
+# save_interval: 1
+
 input_dim: 80
 is_json_cmvn: true
-log_interval: 100
-max_epoch: 20
-model_conf:
-  ctc_weight: 0.3
-  length_normalized_loss: false
-  lsm_weight: 0.1
-  reverse_weight: 0.3
+
 optim: adam
 optim_conf:
   lr: 0.00005
-output_dim: 5538
 scheduler: warmuplr
 scheduler_conf:
   warmup_steps: 5000
