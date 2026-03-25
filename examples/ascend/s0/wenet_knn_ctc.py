@@ -1,252 +1,298 @@
 from __future__ import print_function
 
-from datasets import load_dataset
-import torch
-from jiwer import cer
-import librosa
-import torchaudio
-
-from dataclasses import dataclass, field
-from transformers import HfArgumentParser
-import sys
-import os
-from wenet_knn_ctc_model import KNNSaver_for_ctc, KNNWrapper_for_ctc, KEY_TYPE, DIST
-import time
-
-from datetime import datetime
-
 import argparse
 import copy
 import logging
 import os
 import sys
+import time
+from datetime import datetime
 
+import torch
 import yaml
 from torch.utils.data import DataLoader
 
 from wenet.dataset.dataset import Dataset
-from wenet.paraformer.search.beam_search import build_beam_search
-from wenet.utils.checkpoint import load_checkpoint
-from wenet.utils.file_utils import read_symbol_table, read_non_lang_symbols
 from wenet.utils.config import override_config
 from wenet.utils.init_model import init_model
+from wenet.utils.init_tokenizer import init_tokenizer
+from wenet.utils.context_graph import ContextGraph
+from wenet.utils.ctc_utils import get_blank_id
+from wenet.utils.common import TORCH_NPU_AVAILABLE  # noqa just ensure to check torch-npu
 
-current_time = datetime.now().strftime("%Y_%m_%d_%H_%M")
-
-logger = logging.getLogger(__name__)
-logger.setLevel(20)
-
-file_handler = logging.FileHandler("./log/" + current_time + ".log", mode="w")
-file_handler.setLevel(logging.DEBUG)
-logger.addHandler(file_handler)
-console_handler = logging.StreamHandler()
-logger.addHandler(console_handler)
+from wenet_knn_ctc_model import KNNSaver_for_ctc, KNNWrapper_for_ctc, KEY_TYPE, DIST
 
 
-@dataclass
-class KNNArguments:
-    """
-    external knn arguments
-    """
+def get_args():
+    parser = argparse.ArgumentParser(description='recognize with your model')
+    
+    # ---------------------------------------------------------
+    # normal recogize.py arguments
+    # ---------------------------------------------------------
+    parser.add_argument('--config', required=True, help='config file')
+    parser.add_argument('--test_data', required=True, help='test data file')
+    parser.add_argument('--data_type',
+                        default='raw',
+                        choices=['raw', 'shard'],
+                        help='train and cv data type')
+    parser.add_argument('--gpu',
+                        type=int,
+                        default=-1,
+                        help='gpu id for this rank, -1 for cpu')
+    parser.add_argument('--device',
+                        type=str,
+                        default="cpu",
+                        choices=["cpu", "npu", "cuda"],
+                        help='accelerator to use')
+    parser.add_argument('--dtype',
+                        type=str,
+                        default='fp32',
+                        choices=['fp16', 'fp32', 'bf16'],
+                        help='model\'s dtype')
+    parser.add_argument('--num_workers',
+                        default=0,
+                        type=int,
+                        help='num of subprocess workers for reading')
+    parser.add_argument('--checkpoint', required=True, help='checkpoint model')
+    parser.add_argument('--beam_size',
+                        type=int,
+                        default=10,
+                        help='beam size for search')
+    parser.add_argument('--length_penalty',
+                        type=float,
+                        default=0.0,
+                        help='length penalty')
+    parser.add_argument('--blank_penalty',
+                        type=float,
+                        default=0.0,
+                        help='blank penalty')
+    parser.add_argument('--result_dir', required=True, help='asr result file')
+    parser.add_argument('--batch_size',
+                        type=int,
+                        default=16,
+                        help='asr result file')
+    parser.add_argument('--modes',
+                        nargs='+',
+                        help="""decoding mode, support the following:
+                             attention
+                             ctc_greedy_search
+                             ctc_prefix_beam_search
+                             attention_rescoring
+                             rnnt_greedy_search
+                             rnnt_beam_search
+                             rnnt_beam_attn_rescoring
+                             ctc_beam_td_attn_rescoring
+                             hlg_onebest
+                             hlg_rescore
+                             paraformer_greedy_search
+                             paraformer_beam_search""")
+    parser.add_argument('--search_ctc_weight',
+                        type=float,
+                        default=1.0,
+                        help='ctc weight for nbest generation')
+    parser.add_argument('--search_transducer_weight',
+                        type=float,
+                        default=0.0,
+                        help='transducer weight for nbest generation')
+    parser.add_argument('--ctc_weight',
+                        type=float,
+                        default=0.0,
+                        help='ctc weight for rescoring weight in \
+                                  attention rescoring decode mode \
+                              ctc weight for rescoring weight in \
+                                  transducer attention rescore decode mode')
 
-    knn: bool = field(default=False)
-    knn_gpu: bool = field(default=True)
-    dstore_size: int = field(default=None, metadata={"help": "The size of the dstore."})
-    knn_keytype: KEY_TYPE.from_string = field(default=KEY_TYPE.last_ffn_input)
-    save_knnlm_dstore: bool = field(default=False)
-    dstore_dir: str = field(default="datastore/aishell_dstore")
-    knn_sim_func: DIST.from_string = field(default=DIST.l2)
-    lmbda: float = field(default=0.25)
-    k: int = field(default=1024)
-    knn_temp: float = field(default=1.0)
-    # Args for building the faiss index:
-    build_index: bool = field(default=False)
-    # faiss_index: str = field(default="checkpoints/index")
-    ncentroids: int = field(default=4096)
-    code_size: int = field(default=64)
-    probe: int = field(default=32)
-    num_keys_to_add_at_a_time: int = field(default=1000000)
-    move_dstore_to_mem: bool = field(default=True)
-    no_load_keys: bool = field(default=True)
-    recompute_dists: bool = field(default=False)
-    thr: float = field(default=0.0)  # pseudo label thr
-    decode_skip_blank: bool = field(default=False)
-    scale_lmbda: bool = field(default=False)
-    scale_lmbda_temp: float = field(default=1.0)
-    use_null_mask: bool = field(default=True)
+    parser.add_argument('--transducer_weight',
+                        type=float,
+                        default=0.0,
+                        help='transducer weight for rescoring weight in '
+                        'transducer attention rescore mode')
+    parser.add_argument('--attn_weight',
+                        type=float,
+                        default=0.0,
+                        help='attention weight for rescoring weight in '
+                        'transducer attention rescore mode')
+    parser.add_argument('--decoding_chunk_size',
+                        type=int,
+                        default=-1,
+                        help='''decoding chunk size,
+                                <0: for decoding, use full chunk.
+                                >0: for decoding, use fixed chunk size as set.
+                                0: used for training, it's prohibited here''')
+    parser.add_argument('--num_decoding_left_chunks',
+                        type=int,
+                        default=-1,
+                        help='number of left chunks for decoding')
+    parser.add_argument('--simulate_streaming',
+                        action='store_true',
+                        help='simulate streaming inference')
+    parser.add_argument('--reverse_weight',
+                        type=float,
+                        default=0.0,
+                        help='''right to left weight for attention rescoring
+                                decode mode''')
+    parser.add_argument('--override_config',
+                        action='append',
+                        default=[],
+                        help="override yaml config")
 
+    parser.add_argument('--word',
+                        default='',
+                        type=str,
+                        help='word file, only used for hlg decode')
+    parser.add_argument('--hlg',
+                        default='',
+                        type=str,
+                        help='hlg file, only used for hlg decode')
+    parser.add_argument('--lm_scale',
+                        type=float,
+                        default=0.0,
+                        help='lm scale for hlg attention rescore decode')
+    parser.add_argument('--decoder_scale',
+                        type=float,
+                        default=0.0,
+                        help='lm scale for hlg attention rescore decode')
+    parser.add_argument('--r_decoder_scale',
+                        type=float,
+                        default=0.0,
+                        help='lm scale for hlg attention rescore decode')
 
-@dataclass
-class TestArguments:
-    """
-    normal recogize.py arguments
-    """
+    parser.add_argument(
+        '--context_bias_mode',
+        type=str,
+        default='',
+        help='''Context bias mode, selectable from the following
+                                option: decoding-graph, deep-biasing''')
+    parser.add_argument('--context_list_path',
+                        type=str,
+                        default='',
+                        help='Context list path')
+    parser.add_argument('--context_graph_score',
+                        type=float,
+                        default=0.0,
+                        help='''The higher the score, the greater the degree of
+                                bias using decoding-graph for biasing''')
 
-    config: str = field(default=None, metadata={"help": "config file"})
-    test_data: str = field(default=None, metadata={"help": "test data file"})
-    data_type: str = field(default="raw", metadata={"help": "train and cv data type"})
-    gpu: int = field(default=-1, metadata={"help": "gpu id for this rank, -1 for cpu"})
-    checkpoint: str = field(default=None, metadata={"help": "checkpoint model"})
-    dict: str = field(default=None, metadata={"help": "dict file"})
-    non_lang_syms: str = field(
-        default=None,
-        metadata={"help": "non-linguistic symbol file. One symbol per line."},
-    )
-    beam_size: int = field(default=10, metadata={"help": "beam size for search"})
-    penalty: float = field(default=0.0, metadata={"help": "length penalty"})
-    result_file: str = field(default=None, metadata={"help": "asr result file"})
-    batch_size: int = field(default=16, metadata={"help": "batch size"})
-    mode: str = field(default="knn_ctc", metadata={"help": "decoding mode"})
-    search_ctc_weight: float = field(
-        default=1.0, metadata={"help": "ctc weight for nbest generation"}
-    )
-    search_transducer_weight: float = field(
-        default=0.0,
-        metadata={
-            "help": "transducer weight for nbest generation",
-        },
-    )
-    ctc_weight: float = field(
-        default=0.0,
-        metadata={
-            "help": "ctc weight for rescoring weight in attention rescoring decode mode"
-        },
-    )
-    transducer_weight: float = field(
-        default=0.0,
-        metadata={
-            "help": "transducer weight for rescoring weight in transducer attention rescore decode mode"
-        },
-    )
-    attn_weight: float = field(
-        default=0.0,
-        metadata={
-            "help": "attention weight for rescoring weight in transducer attention rescore decode mode"
-        },
-    )
-    decoding_chunk_size: int = field(
-        default=-1, metadata={"help": "decoding chunk size"}
-    )
-    num_decoding_left_chunks: int = field(
-        default=-1, metadata={"help": "number of left chunks for decoding"}
-    )
-    simulate_streaming: bool = field(
-        default=False, metadata={"help": "simulate streaming inference"}
-    )
-    reverse_weight: float = field(
-        default=0.0,
-        metadata={"help": "right to left weight for attention rescoring decode mode"},
-    )
-    bpe_model: str = field(
-        default=None, metadata={"help": "bpe model for english part"}
-    )
-    connect_symbol: str = field(
-        default="", metadata={"help": "used to connect the output characters"}
-    )
-    word: str = field(
-        default="", metadata={"help": "word file, only used for hlg decode"}
-    )
-    hlg: str = field(
-        default="", metadata={"help": "hlg file, only used for hlg decode"}
-    )
-    lm_scale: float = field(
-        default=0.0, metadata={"help": "lm scale for hlg attention rescore decode"}
-    )
-    decoder_scale: float = field(
-        default=0.0, metadata={"help": "lm scale for hlg attention rescore decode"}
-    )
-    r_decoder_scale: float = field(
-        default=0.0, metadata={"help": "lm scale for hlg attention rescore decode"}
-    )
-    cmvn: str = field(
-        default=None, metadata={"help": "cmvn opt, location of cmvn file."}
-    )
+    parser.add_argument('--use_lora',
+                        type=bool,
+                        default=False,
+                        help='''Whether to use lora for biasing''')
+    parser.add_argument("--lora_ckpt_path",
+                        default=None,
+                        type=str,
+                        help="lora checkpoint path.")
+
+    # ---------------------------------------------------------
+    # external knn arguments
+    # ---------------------------------------------------------
+    parser.add_argument('--knn', action='store_true')
+    parser.add_argument('--knn_gpu', action='store_true', default=True)
+    parser.add_argument('--dstore_size', type=int, default=None)
+    parser.add_argument('--knn_keytype', type=KEY_TYPE.from_string, default=KEY_TYPE.last_ffn_input)
+    parser.add_argument('--save_knnlm_dstore', action='store_true')
+    parser.add_argument('--dstore_dir', type=str, default=None)
+    parser.add_argument('--knn_sim_func', type=DIST.from_string, default=DIST.l2)
+    parser.add_argument('--lmbda', type=float, default=0.25)
+    parser.add_argument('--k', type=int, default=1024)
+    parser.add_argument('--knn_temp', type=float, default=1.0)
+    parser.add_argument('--build_index', action='store_true')
+    parser.add_argument('--ncentroids', type=int, default=4096)
+    parser.add_argument('--code_size', type=int, default=64)
+    parser.add_argument('--probe', type=int, default=32)
+    parser.add_argument('--num_keys_to_add_at_a_time', type=int, default=1000000)
+    parser.add_argument('--move_dstore_to_mem', action='store_true', default=True)
+    parser.add_argument('--no_load_keys', action='store_true', default=True)
+    parser.add_argument('--recompute_dists', action='store_true')
+    parser.add_argument('--thr', type=float, default=0.0, help='pseudo label thr')
+    parser.add_argument('--decode_skip_blank', action='store_true')
+    parser.add_argument('--scale_lmbda', action='store_true')
+    parser.add_argument('--scale_lmbda_temp', type=float, default=1.0)
+    parser.add_argument('--use_null_mask', action='store_true', default=True)
+
+    args = parser.parse_args()
+    print(args)
+    return args
 
 
 def main():
     # step 1, parser
     # ------------------------------
-    parser = HfArgumentParser((KNNArguments, TestArguments))
-    knn_args, args = parser.parse_args_into_dataclasses()
-    if knn_args.knn_temp is not None:
-        print("knn_temp is :", knn_args.knn_temp)
-    logging.basicConfig(
-        level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s"
-    )
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    args = get_args()
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s')
 
-    if (
-        args.mode
-        in [
-            "ctc_prefix_beam_search",
-            "attention_rescoring",
-            "paraformer_beam_search",
-        ]
-        and args.batch_size > 1
-    ):
-        logging.fatal(
-            "decoding mode {} must be running with batch_size == 1".format(args.mode)
-        )
-        sys.exit(1)
+    if args.gpu != -1:
+        # remain the original usage of gpu
+        args.device = "cuda"
+    if "cuda" in args.device:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
-    with open(args.config, "r") as fin:
+    with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
+    if len(args.override_config) > 0:
+        configs = override_config(configs, args.override_config)
 
-    symbol_table = read_symbol_table(args.dict)
-    test_conf = copy.deepcopy(configs["dataset_conf"])
+    test_conf = copy.deepcopy(configs['dataset_conf'])
 
-    test_conf["filter_conf"]["max_length"] = 102400
-    test_conf["filter_conf"]["min_length"] = 0
-    test_conf["filter_conf"]["token_max_length"] = 102400
-    test_conf["filter_conf"]["token_min_length"] = 0
-    test_conf["filter_conf"]["max_output_input_ratio"] = 102400
-    test_conf["filter_conf"]["min_output_input_ratio"] = 0
-    test_conf["speed_perturb"] = False
-    test_conf["spec_aug"] = False
-    test_conf["spec_sub"] = False
-    test_conf["spec_trim"] = False
-    test_conf["shuffle"] = False
-    test_conf["sort"] = False
-    if "fbank_conf" in test_conf:
-        test_conf["fbank_conf"]["dither"] = 0.0
-    elif "mfcc_conf" in test_conf:
-        test_conf["mfcc_conf"]["dither"] = 0.0
-    test_conf["batch_conf"]["batch_type"] = "static"
-    test_conf["batch_conf"]["batch_size"] = args.batch_size
-    non_lang_syms = read_non_lang_symbols(args.non_lang_syms)
+    test_conf['filter_conf']['max_length'] = 102400
+    test_conf['filter_conf']['min_length'] = 0
+    test_conf['filter_conf']['token_max_length'] = 102400
+    test_conf['filter_conf']['token_min_length'] = 0
+    test_conf['filter_conf']['max_output_input_ratio'] = 102400
+    test_conf['filter_conf']['min_output_input_ratio'] = 0
+    test_conf['speed_perturb'] = False
+    test_conf['spec_aug'] = False
+    test_conf['spec_sub'] = False
+    test_conf['spec_trim'] = False
+    test_conf['shuffle'] = False
+    test_conf['sort'] = False
+    test_conf['cycle'] = 1
+    test_conf['list_shuffle'] = False
+    if 'fbank_conf' in test_conf:
+        test_conf['fbank_conf']['dither'] = 0.0
+    elif 'mfcc_conf' in test_conf:
+        test_conf['mfcc_conf']['dither'] = 0.0
+    test_conf['batch_conf']['batch_type'] = "static"
+    test_conf['batch_conf']['batch_size'] = args.batch_size
 
     # ------------------------------
     # step 2, init dataset and model
     # remember to switch dataset
     # when building index , use the training set
     # when test decoing method, use the testing set
+    tokenizer = init_tokenizer(configs)
+    test_dataset = Dataset(args.data_type,
+                           args.test_data,
+                           tokenizer,
+                           test_conf,
+                           partition=False)
 
-    test_dataset = Dataset(
-        args.data_type,
-        args.test_data,
-        symbol_table,
-        test_conf,
-        args.bpe_model,
-        non_lang_syms,
-        partition=False,
-    )
+    test_data_loader = DataLoader(test_dataset,
+                                  batch_size=None,
+                                  num_workers=args.num_workers)
 
-    test_data_loader = DataLoader(test_dataset, batch_size=None, num_workers=0)
+    args.jit = False
+    model, configs = init_model(args, configs)
 
-    # Init asr model from configs
-    model = init_model(configs)
-    print(model)
-
-    # Load dict
-    char_dict = {v: k for k, v in symbol_table.items()}
-    eos = len(char_dict) - 1
-
-    load_checkpoint(model, args.checkpoint)
-    use_cuda = args.gpu >= 0 and torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
+    device = torch.device(args.device)
     model = model.to(device)
-
     model.eval()
+    dtype = torch.float32
+    if args.dtype == 'fp16':
+        dtype = torch.float16
+    elif args.dtype == 'bf16':
+        dtype = torch.bfloat16
+    logging.info("compute dtype is {}".format(dtype))
+
+    context_graph = None
+    if 'decoding-graph' in args.context_bias_mode:
+        context_graph = ContextGraph(args.context_list_path,
+                                     tokenizer.symbol_table,
+                                     configs['tokenizer_conf']['bpe_path'],
+                                     args.context_graph_score)
+
+    _, blank_id = get_blank_id(configs, tokenizer.symbol_table)
+    logging.info("blank_id is {}".format(blank_id))
 
     # ------------------------------
     # step 3, insert KNN
@@ -254,83 +300,91 @@ def main():
     vocab_size = configs["output_dim"]
     knn_wrapper = None
 
-    if knn_args.build_index:
+    if args.build_index:
         knn_wrapper = KNNSaver_for_ctc(
-            dstore_size=knn_args.dstore_size,
-            dstore_dir=knn_args.dstore_dir,
+            dstore_size=args.dstore_size,
+            dstore_dir=args.dstore_dir,
             dimension=dimension,
-            knn_keytype=knn_args.knn_keytype,
-            use_null_mask=knn_args.use_null_mask,
+            knn_keytype=args.knn_keytype,
+            use_null_mask=args.use_null_mask,
         )
-        knn_wrapper.register(model, knn_args.thr, vocab_size)
-    elif knn_args.knn:
+        knn_wrapper.register(model, args.thr, vocab_size)
+    elif args.knn:
         knn_wrapper = KNNWrapper_for_ctc(
-            dstore_size=knn_args.dstore_size,
-            dstore_dir=knn_args.dstore_dir,
+            dstore_size=args.dstore_size,
+            dstore_dir=args.dstore_dir,
             dimension=dimension,
-            knn_sim_func=knn_args.knn_sim_func,
-            knn_keytype=knn_args.knn_keytype,
-            no_load_keys=knn_args.no_load_keys,
-            move_dstore_to_mem=knn_args.move_dstore_to_mem,
-            knn_gpu=knn_args.knn_gpu,
-            recompute_dists=knn_args.recompute_dists,
-            k=knn_args.k,
-            lmbda=knn_args.lmbda,
-            knn_temp=knn_args.knn_temp,
-            probe=knn_args.probe,
-            decode_skip_blank=knn_args.decode_skip_blank,
-            scale_lmbda=knn_args.scale_lmbda,
-            scale_lmbda_temp=knn_args.scale_lmbda_temp,
+            knn_sim_func=args.knn_sim_func,
+            knn_keytype=args.knn_keytype,
+            no_load_keys=args.no_load_keys,
+            move_dstore_to_mem=args.move_dstore_to_mem,
+            knn_gpu=args.knn_gpu,
+            recompute_dists=args.recompute_dists,
+            k=args.k,
+            lmbda=args.lmbda,
+            knn_temp=args.knn_temp,
+            probe=args.probe,
+            decode_skip_blank=args.decode_skip_blank,
+            scale_lmbda=args.scale_lmbda,
+            scale_lmbda_temp=args.scale_lmbda_temp,
         )
         knn_wrapper.register(model)
 
     # ------------------------------
     # step 4: inference
-    start = time.time()
-    with torch.no_grad(), open(args.result_file, "w") as fout:
-        for batch_idx, batch in enumerate(test_data_loader):
-            keys, feats, target, feats_lengths, target_lengths = batch
-            feats = feats.to(device)
-            target = target.to(device)
-            feats_lengths = feats_lengths.to(device)
-            target_lengths = target_lengths.to(device)
+    files = {}
+    for mode in args.modes:
+        dir_name = os.path.join(args.result_dir, mode)
+        os.makedirs(dir_name, exist_ok=True)
+        file_name = os.path.join(dir_name, 'text')
+        files[mode] = open(file_name, 'w', encoding='utf-8')
+    max_format_len = max([len(mode) for mode in args.modes])
 
-            if args.mode == "ctc_greedy_search":
-                hyps, _ = model.ctc_greedy_search(
+    with torch.cuda.amp.autocast(enabled=True,
+                                 dtype=dtype,
+                                 cache_enabled=False):
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(test_data_loader):
+                keys = batch["keys"]
+                feats = batch["feats"].to(device)
+                target = batch["target"].to(device)
+                feats_lengths = batch["feats_lengths"].to(device)
+                target_lengths = batch["target_lengths"].to(device)
+                infos = {"tasks": batch["tasks"], "langs": batch["langs"]}
+                results = model.decode(
+                    args.modes,
                     feats,
                     feats_lengths,
+                    args.beam_size,
                     decoding_chunk_size=args.decoding_chunk_size,
                     num_decoding_left_chunks=args.num_decoding_left_chunks,
+                    ctc_weight=args.ctc_weight,
                     simulate_streaming=args.simulate_streaming,
-                )
-            elif args.mode == "knn_ctc":
-                hyps, _ = model.knn_ctc_greedy_search(
-                    feats,
-                    feats_lengths,
-                    decoding_chunk_size=args.decoding_chunk_size,
-                    num_decoding_left_chunks=args.num_decoding_left_chunks,
-                    simulate_streaming=args.simulate_streaming,
-                    knn_args=knn_args,
-                    knn_wrapper=knn_wrapper,
-                )
+                    reverse_weight=args.reverse_weight,
+                    context_graph=context_graph,
+                    blank_id=blank_id,
+                    blank_penalty=args.blank_penalty,
+                    length_penalty=args.length_penalty,
+                    infos=infos,
+                    knn_args=args,
+                    knn_wrapper=knn_wrapper)
+                for i, key in enumerate(keys):
+                    for mode, hyps in results.items():
+                        tokens = hyps[i].tokens
+                        line = '{} {}'.format(key,
+                                              tokenizer.detokenize(tokens)[0])
+                        logging.info('{} {}'.format(mode.ljust(max_format_len),
+                                                    line))
+                        files[mode].write(line + '\n')
+        for mode, f in files.items():
+            f.close()
 
-            for i, key in enumerate(keys):
-                content = []
-                for w in hyps[i]:
-                    if w == eos:
-                        break
-                    content.append(char_dict[w])
-                logging.info("{} {}".format(key, args.connect_symbol.join(content)))
-                fout.write("{} {}\n".format(key, args.connect_symbol.join(content)))
-
-    logger.info("eval took {} s".format(time.time() - start))
-    # print('eval took {} s'.format(time.time() - start))
-    if knn_args.build_index:
+    if args.build_index:
         knn_wrapper.build_index()
 
-    if knn_args.build_index:
+    if args.build_index:
         dstore_index = knn_wrapper.show_dstore_index()
-        current_path = os.path.dirname(args.result_file)
+        current_path = os.path.dirname(args.result_dir)
         with open(os.path.join(current_path, "index_size"), "w") as f:
             f.write("the total datastore size is :" + str(dstore_index))
 

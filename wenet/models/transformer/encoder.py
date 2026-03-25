@@ -55,6 +55,7 @@ class BaseEncoder(torch.nn.Module):
         layer_norm_type: str = 'layer_norm',
         norm_eps: float = 1e-5,
         final_norm: bool = True,
+        insert_knn: bool = False,
     ):
         """
         Args:
@@ -116,6 +117,13 @@ class BaseEncoder(torch.nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.use_sdpa = use_sdpa
 
+        # for knn
+        self.insert_knn = insert_knn
+        self.embed_to_store = None
+
+    def get_embed_to_store(self):
+        return self.embed_to_store
+
     def output_size(self) -> int:
         return self._output_size
 
@@ -173,6 +181,10 @@ class BaseEncoder(torch.nn.Module):
                                                   mask_pad)
         else:
             xs = self.forward_layers(xs, chunk_masks, pos_emb, mask_pad)
+
+        if self.insert_knn:
+            self.embed_to_store = self.encoders[-1].get_embed_to_store()
+
         if self.normalize_before and self.final_norm:
             xs = self.after_norm(xs)
         # Here we assume the mask is not changed in encoder layers, so just
@@ -480,6 +492,7 @@ class ConformerEncoder(BaseEncoder):
         conv_norm_eps: float = 1e-5,
         conv_inner_factor: int = 2,
         final_norm: bool = True,
+        insert_knn: bool = True,
     ):
         """Construct ConformerEncoder
 
@@ -504,7 +517,7 @@ class ConformerEncoder(BaseEncoder):
                          input_layer, pos_enc_layer_type, normalize_before,
                          static_chunk_size, use_dynamic_chunk, global_cmvn,
                          use_dynamic_left_chunk, gradient_checkpointing,
-                         use_sdpa, layer_norm_type, norm_eps, final_norm)
+                         use_sdpa, layer_norm_type, norm_eps, final_norm, insert_knn)
         activation = WENET_ACTIVATION_CLASSES[activation_type]()
 
         # self-attention module definition

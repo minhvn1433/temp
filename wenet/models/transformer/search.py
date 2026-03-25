@@ -124,6 +124,39 @@ def ctc_greedy_search(ctc_probs: torch.Tensor,
     return results
 
 
+def knn_ctc_greedy_search(
+    ctc_probs: torch.Tensor,
+    ctc_lens: torch.Tensor,
+    knn_key: torch.Tensor,
+    knn_args=None,
+    knn_wrapper=None,
+    blank_id: int = 0,
+) -> List[DecodeResult]:
+    batch_size = ctc_probs.shape[0]
+    maxlen = ctc_probs.size(1)
+    # when topk k=1, topk_prob = predict_ids
+    topk_prob, topk_index = ctc_probs.topk(1, dim=2)  # (B, maxlen, 1) , (B, maxlen, k)
+    topk_index = topk_index.view(batch_size, maxlen)  # (B, maxlen)
+    mask = make_pad_mask(ctc_lens, maxlen)  # (B, maxlen)
+    topk_index = topk_index.masked_fill_(mask, blank_id)  # (B, maxlen)
+    hyps = [hyp.tolist() for hyp in topk_index]
+    scores = topk_prob.max(1)
+
+    # topk_prob.size (B, maxlen, topk)
+    if knn_args.build_index:
+        knn_wrapper.process(knn_key, topk_index, topk_prob.squeeze(-1))
+    elif knn_args.knn:
+        softmax_outputs, dists, vals_at_knns = knn_wrapper.process(knn_key, ctc_probs)
+        # cover confidence and predicted_ids.
+        scores, top1_index = torch.max(softmax_outputs,dim=-1)
+        hyps = [hyp.tolist() for hyp in top1_index]
+    results = []
+    for hyp in hyps:
+        r = DecodeResult(remove_duplicates_and_blank(hyp, blank_id))
+        results.append(r)
+    return results
+
+
 def ctc_prefix_beam_search(
     ctc_probs: torch.Tensor,
     ctc_lens: torch.Tensor,

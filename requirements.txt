@@ -29,3 +29,6 @@ datasets<2.20.0
 jiwer==3.0.3
 transformers==4.38.0
 faiss_gpu==1.7.2
+jieba==0.42.1
+opencc==1.2.0
+editdistance==0.8.1

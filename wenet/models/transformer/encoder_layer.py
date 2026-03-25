@@ -184,6 +184,11 @@ class ConformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
+        # for knn
+        self.embed_to_store = None
+
+    def get_embed_to_store(self):
+        return self.embed_to_store
 
     def forward(
         self,
@@ -254,6 +259,9 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm_ff(x)
+
+        # the best location of the key for knn.
+        self.embed_to_store = x.clone().detach()
 
         x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
         if not self.normalize_before:

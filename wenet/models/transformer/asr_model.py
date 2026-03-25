@@ -26,7 +26,8 @@ from wenet.models.transformer.search import (DecodeResult,
                                              attention_beam_search,
                                              attention_rescoring,
                                              ctc_greedy_search,
-                                             ctc_prefix_beam_search)
+                                             ctc_prefix_beam_search,
+                                             knn_ctc_greedy_search)
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, reverse_pad_list,
                                 th_accuracy)
 from wenet.utils.context_graph import ContextGraph
@@ -280,6 +281,8 @@ class ASRModel(torch.nn.Module):
         blank_penalty: float = 0.0,
         length_penalty: float = 0.0,
         infos: Dict[str, List[str]] = None,
+        knn_args=None,
+        knn_wrapper=None,
     ) -> Dict[str, List[DecodeResult]]:
         """ Decode input speech
 
@@ -288,6 +291,7 @@ class ASRModel(torch.nn.Module):
                 could contain the following decoding methods, please refer paper:
                 https://arxiv.org/pdf/2102.01547.pdf
                    * ctc_greedy_search
+                   * knn_ctc
                    * ctc_prefix_beam_search
                    * atttention
                    * attention_rescoring
@@ -321,6 +325,18 @@ class ASRModel(torch.nn.Module):
         if 'ctc_greedy_search' in methods:
             results['ctc_greedy_search'] = ctc_greedy_search(
                 ctc_probs, encoder_lens, blank_id)
+        if 'knn_ctc' in methods:
+            knn_location_flag=True
+            # change the location to insert knn to reserve knn_key.
+            if knn_location_flag:
+                # get the last conformer layer's FFN input after layer normalization
+                knn_key = self.encoder.get_embed_to_store() 
+            else:
+                knn_key = encoder_out
+            
+            results['knn_ctc'] = knn_ctc_greedy_search(
+                ctc_probs, encoder_lens, knn_key, 
+                knn_args, knn_wrapper, blank_id)
         if 'ctc_prefix_beam_search' in methods:
             ctc_prefix_result = ctc_prefix_beam_search(ctc_probs, encoder_lens,
                                                        beam_size,

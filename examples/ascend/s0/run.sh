@@ -6,19 +6,10 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib:$LD_LIBRARY_PATH
 # Copyright 2019 Mobvoi Inc. All Rights Reserved.
 . ./path.sh || exit 1;
 
-# Automatically detect number of gpus
-if command -v nvidia-smi &> /dev/null; then
-  num_gpus=$(nvidia-smi -L | wc -l)
-  gpu_list=$(seq -s, 0 $((num_gpus-1)))
-else
-  num_gpus=-1
-  gpu_list="-1"
-fi
-
-gpu=0
 # You can also manually specify CUDA_VISIBLE_DEVICES
 # if you don't want to utilize all available GPU resources.
-export CUDA_VISIBLE_DEVICES="${gpu_list}"
+gpu=0
+export CUDA_VISIBLE_DEVICES="${gpu}"
 echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
 
 stage=-1 # start from 0 if you need to start from data preparation
@@ -35,42 +26,37 @@ job_id=2023
 # faster on reading data and training.
 data_type=raw
 ASCEND=downloads
-dstore_name=ASCEND_dstore
+dstore_name=D_ALL
+dstore_name_zh=D_CN
+dstore_name_en=D_EN
 
 # model setting
 train_config=conf/train.yaml
 checkpoint=exp/20220506_u2pp_conformer_exp_wenetspeech/final.pt
-dict=exp/20220506_u2pp_conformer_exp_wenetspeech/units.txt
 dir=exp/20220506_u2pp_conformer_exp_ascend
 tensorboard_dir=tensorboard
 
 # training resources
-num_workers=8
+num_workers=4
 prefetch=10
 
 # decoding setting
 decode_checkpoint=$dir/final.pt
-average_checkpoint=true
-average_num=5
-average_mode=step
-max_step=88888888
 
 # knn setting
 decode_modes="knn_ctc"
 dstore_dir="datastore/d_all"
-use_null_mask=True # build datastore with skip-blank strategy
-decode_skip_blank=True # decoding with skip-blank strategy
-dstore_size=1798000 # dstore_size=13000001
+dstore_size=455671
 lmbda=0.45 # interpolate weight, adjust to the dataset
 thr=0.0 # threshold of CTC pseudo label, default = 0
-knn_temp=1.0 # temperature, defalut = 1  
+knn_temp=1.0 # temperature, default = 1  
 k=1024 # k neighbours
 
 # gated monolingual knn setting
 dstore_dir_zh="datastore/d_cn"
 dstore_dir_en="datastore/d_en"
-dstore_size_zh=1000000
-dstore_size_en=798000
+dstore_size_zh=309650
+dstore_size_en=146021
 
 # no use
 scale_lmbda=False
@@ -79,7 +65,7 @@ scale_lmbda_temp=1
 # training engine
 train_engine=torch_ddp
 
-deepspeed_config=conf/ds_stage2.json
+deepspeed_config=
 deepspeed_save_states="model_only"
 
 . tools/parse_options.sh || exit 1;
@@ -112,7 +98,7 @@ fi
 
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
   echo "stage 1: extract cmvn features"
-  python tools/compute_cmvn_stats.py --num_workers 8 --train_config $train_config \
+  python tools/compute_cmvn_stats.py --num_workers 4 --train_config $train_config \
       --in_scp data/train/wav.scp \
       --out_cmvn data/train/global_cmvn
 fi
@@ -130,7 +116,7 @@ fi
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   echo "stage 3: neural network training"
   mkdir -p $dir
-  num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
+  num_gpus=1
   # Use "nccl" if it works, otherwise use "gloo"
   dist_backend="nccl"
   # train.py rewrite $train_config to $dir/train.yaml with model input
@@ -165,6 +151,7 @@ fi
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   echo "stage 4: ctc decoding"
   decode_modes="ctc_greedy_search"
+  mkdir -p log
 
   # no use
   decoding_chunk_size=
@@ -175,7 +162,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   {
     test_dir=$dir/test_${mode}_ascend
     mkdir -p $test_dir
-    python wenet/bin/recognize.py --gpu $gpu \
+    python wenet_knn_ctc.py --gpu $gpu \
       --modes $mode \
       --config $dir/train.yaml \
       --data_type $data_type \
@@ -183,17 +170,18 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
-      --result_file $test_dir/ascend_text \
+      --result_dir $test_dir \
       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
 
-    sed -i "s|▁| |g" $test_dir/ascend_text
+    sed -i "s|▁| |g" $test_dir/$mode/text
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/ascend_text > $test_dir/ascend_wer
-    tail $test_dir/ascend_wer
+      data/test/text $test_dir/$mode/text > $test_dir/$mode/wer
+    tail $test_dir/$mode/wer
+    python tools/compute-mer.py \
+      data/test/text $test_dir/$mode/text > $test_dir/$mode/mer
   }
   done
 fi
@@ -214,25 +202,24 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     mkdir -p $test_dir
     mkdir -p $dstore_dir
     python wenet_knn_ctc.py --gpu $gpu \
-      --mode $mode \
+      --modes $mode \
       --config $dir/train.yaml \
       --data_type $data_type \
       --test_data data/train/data.list \
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
+      --result_dir $test_dir \
       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
       --build_index \
-      --dstore_dir $dstore_dir\
+      --dstore_dir $dstore_dir \
       --dstore_size $dstore_size \
       --lmbda $lmbda \
       --thr $thr \
-      --use_null_mask $use_null_mask
+      --use_null_mask # build datastore with skip-blank strategy
   }
   done
 fi
@@ -240,6 +227,7 @@ fi
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
   echo "stage 6: knn_ctc decoding"
   decode_modes="knn_ctc"
+  mkdir -p log
 
   # no use
   decoding_chunk_size=
@@ -251,32 +239,33 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     test_dir=$dir/test_${mode}_${dstore_size}_${dstore_name}_on_ascend
     mkdir -p $test_dir
     python wenet_knn_ctc.py  --gpu $gpu \
-      --mode $mode \
+      --modes $mode \
       --config $dir/train.yaml \
       --data_type $data_type \
       --test_data data/test/data.list \
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
-      --result_file $test_dir/ascend_text \
+      --result_dir $test_dir \
       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
       --knn \
-      --dstore_dir $dstore_dir\
+      --dstore_dir $dstore_dir \
       --dstore_size $dstore_size \
       --lmbda $lmbda \
       --knn_temp $knn_temp \
       --k $k \
-      --decode_skip_blank $decode_skip_blank\
-      --scale_lmbda $scale_lmbda\
+      --decode_skip_blank \
+      --scale_lmbda $scale_lmbda \
       --scale_lmbda_temp $scale_lmbda_temp
-    sed -i "s|▁| |g" $test_dir/ascend_text
+    sed -i "s|▁| |g" $test_dir/$mode/text
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/ascend_text > $test_dir/ascend_wer
-    tail $test_dir/ascend_wer
+      data/test/text $test_dir/$mode/text > $test_dir/$mode/wer
+    tail $test_dir/$mode/wer
+    python tools/compute-mer.py \
+      data/test/text $test_dir/$mode/text > $test_dir/$mode/mer
   }
   done
 fi
@@ -284,6 +273,7 @@ fi
 if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   echo "stage 7: build monolingual datastores (D_CN, D_EN)"
   decode_modes="knn_ctc"
+  mkdir -p log
 
   # no use
   decoding_chunk_size=
@@ -293,66 +283,102 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   # build chinese datastore (D_CN)
   for mode in ${decode_modes}; do
   {
-    test_dir=$dir/test_${mode}_${dstore_size_zh}_${dstore_name}_on_ascend
+    test_dir=$dir/test_${mode}_${dstore_size_zh}_${dstore_name_zh}_on_ascend
     mkdir -p $test_dir
-    mkdir -p $dstore_dir
+    mkdir -p $dstore_dir_zh
     python wenet_knn_ctc.py --gpu $gpu \
-      --mode $mode \
+      --modes $mode \
       --config $dir/train.yaml \
       --data_type $data_type \
-      --test_data data/train/data.list \
+      --test_data data/train_zh/data.list \
       --checkpoint $decode_checkpoint \
       --beam_size 10 \
       --batch_size 1 \
-      --penalty 0.0 \
-      --dict $dict \
+      --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
+      --result_dir $test_dir \
       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
       --build_index \
-      --dstore_dir $dstore_dir\
-      --dstore_size $dstore_size \
+      --dstore_dir $dstore_dir_zh \
+      --dstore_size $dstore_size_zh \
       --lmbda $lmbda \
       --thr $thr \
-      --use_null_mask $use_null_mask
+      --use_null_mask # build datastore with skip-blank strategy
   }
   done
-  python wenet_knn_ctc.py --gpu $gpu --mode "knn_ctc" \
-    --config $dir/train.yaml --data_type $data_type \
-    --test_data data/train_zh/data.list \
-    --checkpoint $decode_checkpoint \
-    --build_index --dstore_dir "datastore/ascend_zh" \
-    --dstore_size $dstore_size_zh ...
 
   # build english datastore (D_EN)
-  python wenet_knn_ctc.py --gpu $gpu --mode "knn_ctc" \
-    --config $dir/train.yaml --data_type $data_type \
-    --test_data data/train_en/data.list \
-    --checkpoint $decode_checkpoint \
-    --build_index --dstore_dir "datastore/ascend_en" \
-    --dstore_size $dstore_size_en ...
+  for mode in ${decode_modes}; do
+  {
+    test_dir=$dir/test_${mode}_${dstore_size_en}_${dstore_name_en}_on_ascend
+    mkdir -p $test_dir
+    mkdir -p $dstore_dir_en
+    python wenet_knn_ctc.py --gpu $gpu \
+      --modes $mode \
+      --config $dir/train.yaml \
+      --data_type $data_type \
+      --test_data data/train_en/data.list \
+      --checkpoint $decode_checkpoint \
+      --beam_size 10 \
+      --batch_size 1 \
+      --blank_penalty 0.0 \
+      --ctc_weight $ctc_weight \
+      --reverse_weight $reverse_weight \
+      --result_dir $test_dir \
+      ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
+      --build_index \
+      --dstore_dir $dstore_dir_en \
+      --dstore_size $dstore_size_en \
+      --lmbda $lmbda \
+      --thr $thr \
+      --use_null_mask # build datastore with skip-blank strategy
+  }
+  done
 fi
 
-if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
-  echo "stage 8: gated monolingual knn_ctc decoding"
-  decode_modes="knn_ctc"
+# if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+#   echo "stage 8: gated monolingual knn_ctc decoding"
+#   decode_modes="knn_ctc"
+#   mkdir -p log
+
+#   # no use
+#   decoding_chunk_size=
+#   ctc_weight=0.5
+#   reverse_weight=0.0
   
-  # Ensure your script points to BOTH directories
-  python wenet_knn_ctc.py --gpu $gpu --mode "knn_ctc" \
-    --config $dir/train.yaml --data_type $data_type \
-    --test_data data/test/data.list \
-    --checkpoint $decode_checkpoint \
-    --knn --gated_mode True \
-    --dstore_dir_zh "datastore/ascend_zh" \
-    --dstore_dir_en "datastore/ascend_en" \
-    --result_file $dir/test_ours_gated/text ...
-fi
-
-# if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
-#   echo "stage 9: Export the trained model"
-#   python wenet/bin/export_jit.py \
-#     --config $dir/train.yaml \
-#     --checkpoint $dir/avg_${average_num}.pt \
-#     --output_file $dir/final.zip
+#   for mode in ${decode_modes}; do
+#   {
+#     test_dir=$dir/test_${mode}_${dstore_size}_${dstore_name}_on_ascend
+#     mkdir -p $test_dir
+#     python wenet_knn_ctc.py  --gpu $gpu \
+#       --modes $mode \
+#       --config $dir/train.yaml \
+#       --data_type $data_type \
+#       --test_data data/test/data.list \
+#       --checkpoint $decode_checkpoint \
+#       --beam_size 10 \
+#       --batch_size 1 \
+#       --blank_penalty 0.0 \
+#       --ctc_weight $ctc_weight \
+#       --reverse_weight $reverse_weight \
+#       --result_dir $test_dir \
+#       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
+#       --knn \
+#       --dstore_dir $dstore_dir \
+#       --dstore_size $dstore_size \
+#       --lmbda $lmbda \
+#       --knn_temp $knn_temp \
+#       --k $k \
+#       --decode_skip_blank \
+#       --scale_lmbda $scale_lmbda \
+#       --scale_lmbda_temp $scale_lmbda_temp
+#     sed -i "s|▁| |g" $test_dir/$mode/text
+#     python tools/compute-wer.py --char=1 --v=1 \
+#       data/test/text $test_dir/$mode/text > $test_dir/$mode/wer
+#     tail $test_dir/$mode/wer
+#     python tools/compute-mer.py \
+#       data/test/text $test_dir/$mode/text > $test_dir/$mode/mer
+#   }
+#   done
 # fi
