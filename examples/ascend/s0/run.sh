@@ -144,8 +144,6 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
       --num_workers ${num_workers} \
       --prefetch ${prefetch} \
       --pin_memory \
-      --deepspeed_config ${deepspeed_config} \
-      --deepspeed.save_states ${deepspeed_save_states}
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
