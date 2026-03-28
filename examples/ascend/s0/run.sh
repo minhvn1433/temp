@@ -46,7 +46,7 @@ decode_checkpoint=$dir/final.pt
 # knn setting
 decode_modes="knn_ctc"
 dstore_dir="datastore/d_all"
-dstore_size=455671
+dstore_size=170235 # 455671
 lmbda=0.45 # interpolate weight, adjust to the dataset
 thr=0.0 # threshold of CTC pseudo label, default = 0
 knn_temp=1.0 # temperature, default = 1  
@@ -55,11 +55,10 @@ k=1024 # k neighbours
 # gated monolingual knn setting
 dstore_dir_zh="datastore/d_cn"
 dstore_dir_en="datastore/d_en"
-dstore_size_zh=309650
-dstore_size_en=146021
+dstore_size_zh=61631 # 309650
+dstore_size_en=108604 # 146021
 
 # no use
-scale_lmbda=False
 scale_lmbda_temp=1
 
 # training engine
@@ -256,8 +255,11 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
       --knn_temp $knn_temp \
       --k $k \
       --decode_skip_blank \
-      --scale_lmbda $scale_lmbda \
-      --scale_lmbda_temp $scale_lmbda_temp
+      --scale_lmbda_temp $scale_lmbda_temp \
+      --knn_gpu \
+      --move_dstore_to_mem \
+      --no_load_keys \
+      --use_null_mask
     sed -i "s|▁| |g" $test_dir/$mode/text
     python tools/compute-wer.py --char=1 --v=1 \
       data/test/text $test_dir/$mode/text > $test_dir/$mode/wer
@@ -369,8 +371,11 @@ fi
 #       --knn_temp $knn_temp \
 #       --k $k \
 #       --decode_skip_blank \
-#       --scale_lmbda $scale_lmbda \
-#       --scale_lmbda_temp $scale_lmbda_temp
+#       --scale_lmbda_temp $scale_lmbda_temp \
+#       --knn_gpu \
+#       --move_dstore_to_mem \
+#       --no_load_keys \
+#       --use_null_mask
 #     sed -i "s|▁| |g" $test_dir/$mode/text
 #     python tools/compute-wer.py --char=1 --v=1 \
 #       data/test/text $test_dir/$mode/text > $test_dir/$mode/wer
