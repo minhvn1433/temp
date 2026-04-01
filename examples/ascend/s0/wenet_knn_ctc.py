@@ -187,13 +187,15 @@ def get_args():
     # ---------------------------------------------------------
     parser.add_argument('--knn', action='store_true')
     parser.add_argument('--knn_gpu', action='store_true')
-    parser.add_argument('--dstore_size', type=int, default=None)
+    parser.add_argument('--dstore_size', type=int, nargs='+', default=None)
     parser.add_argument('--knn_keytype', type=KEY_TYPE.from_string, default=KEY_TYPE.last_ffn_input)
     parser.add_argument('--save_knnlm_dstore', action='store_true')
-    parser.add_argument('--dstore_dir', type=str, default=None)
+    parser.add_argument('--dstore_dir', type=str, nargs='+',default=None)
     parser.add_argument('--knn_sim_func', type=DIST.from_string, default=DIST.l2)
     parser.add_argument('--lmbda', type=float, default=0.25)
     parser.add_argument('--k', type=int, default=1024)
+    parser.add_argument('--n', type=int, default=300)
+    parser.add_argument('--t', type=float, default=1.0)
     parser.add_argument('--knn_temp', type=float, default=1.0)
     parser.add_argument('--build_index', action='store_true')
     parser.add_argument('--ncentroids', type=int, default=1024)
@@ -302,14 +304,28 @@ def main():
 
     if args.build_index:
         knn_wrapper = KNNSaver_for_ctc(
-            dstore_size=args.dstore_size,
-            dstore_dir=args.dstore_dir,
+            dstore_size=args.dstore_size[0],
+            dstore_dir=args.dstore_dir[0],
             dimension=dimension,
             knn_keytype=args.knn_keytype,
             use_null_mask=args.use_null_mask,
         )
         knn_wrapper.register(model, args.thr, vocab_size)
     elif args.knn:
+        # hardcode the language id ranges based on the symbol table
+        symbol_table_path = symbol_table_path = configs['tokenizer_conf']['symbol_table_path']
+        en_indices = list(range(4, 30))
+        zh_indices = list(range(32, vocab_size))
+
+        # check if we are in gated monolingual mode (2 directories) 
+        # or in regular knn mode (1 directory)
+        is_gated = len(args.dstore_dir) > 1 if args.dstore_dir else False
+
+        if is_gated:
+            logging.info("Initializing Gated Monolingual KNN Wrapper (Dual Datastores)")
+        else:
+            logging.info("Initializing Standard KNN Wrapper (Single Datastore)")
+
         knn_wrapper = KNNWrapper_for_ctc(
             dstore_size=args.dstore_size,
             dstore_dir=args.dstore_dir,
@@ -321,12 +337,16 @@ def main():
             knn_gpu=args.knn_gpu,
             recompute_dists=args.recompute_dists,
             k=args.k,
+            n=args.n,
+            t=args.t,
             lmbda=args.lmbda,
             knn_temp=args.knn_temp,
             probe=args.probe,
             decode_skip_blank=args.decode_skip_blank,
             scale_lmbda=args.scale_lmbda,
             scale_lmbda_temp=args.scale_lmbda_temp,
+            zh_indices=zh_indices,
+            en_indices=en_indices,
         )
         knn_wrapper.register(model)
 

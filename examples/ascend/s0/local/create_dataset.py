@@ -7,6 +7,7 @@ raw_dataset = load_dataset("CAiRE/ASCEND", cache_dir="downloads/cache/")
 ascend_asr = DatasetDict()
 ascend_asr["train_zh"] = raw_dataset["train"].filter(lambda x: x["language"] == "zh")
 ascend_asr["train_en"] = raw_dataset["train"].filter(lambda x: x["language"] == "en")
+ascend_asr["train_mixed"] = raw_dataset["train"].filter(lambda x: x["language"] == "mixed")
 ascend_asr["train"] = concatenate_datasets(
     [
         ascend_asr["train_zh"],
@@ -14,12 +15,7 @@ ascend_asr["train"] = concatenate_datasets(
     ]
 )
 ascend_asr["validation"] = raw_dataset["validation"]
-ascend_asr["test"] = concatenate_datasets(
-    [
-        raw_dataset["test"],
-        raw_dataset["train"].filter(lambda x: x["language"] == "mixed"),
-    ]
-)
+ascend_asr["test"] = raw_dataset["test"]
 
 os.makedirs("storage", exist_ok=True)
 for split in raw_dataset.keys():
@@ -77,6 +73,7 @@ def create_csv(split):
 
 create_csv("train_zh")
 create_csv("train_en")
+create_csv("train_mixed")
 create_csv("train")
 create_csv("validation")
 create_csv("test")

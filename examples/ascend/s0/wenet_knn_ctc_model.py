@@ -55,13 +55,18 @@ class KNNWrapper_for_ctc(object):
                  knn_sim_func=None, knn_keytype=None,
                  no_load_keys=False, move_dstore_to_mem=False, knn_gpu=True,
                  recompute_dists=False,
-                 k=1024, lmbda=0.25, knn_temp=1.0, probe=32, decode_skip_blank=False,
-                 scale_lmbda=False, scale_lmbda_temp=1.0):
-        self.dstore_size = dstore_size
-        self.dstore_dir = dstore_dir
+                 k=1024, n=300, t=1.0, lmbda=0.25, knn_temp=1.0, probe=32, decode_skip_blank=False,
+                 scale_lmbda=False, scale_lmbda_temp=1.0,
+                 zh_indices=None, en_indices=None):
+        self.dstore_size = dstore_size if isinstance(dstore_size, list) else [dstore_size]
+        self.dstore_dir = dstore_dir if isinstance(dstore_dir, list) else [dstore_dir]
+        self.is_gated = len(dstore_dir) > 1
+
         self.dimension = dimension
         self.lmbda = lmbda
         self.k = k
+        self.n = n
+        self.t = t
         self.knn_temperature = knn_temp
         self.probe = probe
         self.knn_sim_func = DIST.l2 if knn_sim_func is None else knn_sim_func
@@ -73,8 +78,15 @@ class KNNWrapper_for_ctc(object):
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.prompt_input_ids = None
+
         self.keys = None
-        self.values = None
+        self.vals = None
+        self.index = None
+        self.reconstruct_index = None
+
+        self.zh_indices = zh_indices
+        self.en_indices = en_indices
+
         self.prompt_attention_mask = None
         self.model = None
         self.vocab_size = None
@@ -92,61 +104,70 @@ class KNNWrapper_for_ctc(object):
         if not self.dstore_dir:
             raise ValueError('Cannot build a datastore without the data.')
 
-        start = time.time()
-        index_name = get_index_path(self.dstore_dir, self.dstore_size, self.dimension)
-        cpu_index = faiss.read_index(index_name, faiss.IO_FLAG_ONDISK_SAME_DIR)
-        logger.info(f'Reading datastore took {time.time() - start} s')
-        cpu_index.nprobe = self.probe
+        cpu_indexes, gpu_indexes, all_vals, all_keys = [], [], [], []
 
-        if self.knn_gpu:
+        for i in range(len(self.dstore_dir)):
             start = time.time()
-            co = faiss.GpuClonerOptions()
-            co.useFloat16 = True
-            gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, cpu_index, co)
-            logger.info(f'Moving index to GPU took {time.time() - start} s')
-        else:
-            gpu_index = cpu_index
+            index_name = get_index_path(self.dstore_dir[i], self.dstore_size[i], self.dimension)
+            cpu_index = faiss.read_index(index_name, faiss.IO_FLAG_ONDISK_SAME_DIR)
+            logger.info(f'Reading datastore took {time.time() - start} s')
+            cpu_index.nprobe = self.probe
 
-        # make_direct_map() allows calling reconstruct(n),
-        # and reconstructing key vectors given their ids
-        # currently, this is implemented only for CPU indexes:
-        # https://github.com/facebookresearch/faiss/issues/2181
-        cpu_index.make_direct_map()
+            if self.knn_gpu:
+                start = time.time()
+                co = faiss.GpuClonerOptions()
+                co.useFloat16 = True
+                gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), 0, cpu_index, co)
+                logger.info(f'Moving index to GPU took {time.time() - start} s')
+            else:
+                gpu_index = cpu_index
 
-        keys_vals_prefix = get_dstore_path(self.dstore_dir, self.dstore_size,
-                                           self.dimension)
-        # read a memory-map to an array stored in a binary file on disk.
-        if not self.no_load_keys:
-            self.keys = np.memmap(f'{keys_vals_prefix}_keys.npy', dtype=np.float16, mode='r',
-                                  shape=(self.dstore_size, self.dimension))
-        self.vals = np.memmap(f'{keys_vals_prefix}_vals.npy', dtype=np.int32, mode='r',
-                              shape=(self.dstore_size, 1))
-        # self.vals = torch.from_numpy(self.vals).to(self.device)
+            # make_direct_map() allows calling reconstruct(n),
+            # and reconstructing key vectors given their ids
+            # currently, this is implemented only for CPU indexes:
+            # https://github.com/facebookresearch/faiss/issues/2181
+            cpu_index.make_direct_map()
 
-        # If you wish to load all the keys into memory
-        # CAUTION: Only do this if your RAM can handle it!
-        if self.move_dstore_to_mem:
-            logger.info('Loading to memory...')
-            start = time.time()
-
+            keys_vals_prefix = get_dstore_path(self.dstore_dir[i], self.dstore_size[i],
+                                            self.dimension)
+            # read a memory-map to an array stored in a binary file on disk.
+            keys=None
             if not self.no_load_keys:
-                del self.keys
-                self.keys_from_memmap = np.memmap(f'{keys_vals_prefix}_keys.npy',
-                                                  dtype=np.float16, mode='r', shape=(self.dstore_size, self.dimension))
-                self.keys = self.keys_from_memmap[:].astype(np.float16)
+                keys = np.memmap(f'{keys_vals_prefix}_keys.npy', dtype=np.float16, mode='r',
+                                    shape=(self.dstore_size[i], self.dimension))
+            vals = np.memmap(f'{keys_vals_prefix}_vals.npy', dtype=np.int32, mode='r',
+                                shape=(self.dstore_size[i], 1))
 
-            del self.vals
-            vals_from_memmap = np.memmap(f'{keys_vals_prefix}_vals.npy', dtype=np.int32, mode='r',
-                                         shape=(self.dstore_size, 1))
-            self.vals = torch.from_numpy(vals_from_memmap[:]).long().to(self.device)
-            del vals_from_memmap
-            logger.info('Loading to memory took {} s'.format(time.time() - start))
+            # If you wish to load all the keys into memory
+            # CAUTION: Only do this if your RAM can handle it!
+            if self.move_dstore_to_mem:
+                logger.info('Loading to memory...')
+                start = time.time()
 
-        return cpu_index, gpu_index
+                if not self.no_load_keys:
+                    keys_from_memmap = np.memmap(f'{keys_vals_prefix}_keys.npy',
+                                                    dtype=np.float16, mode='r', shape=(self.dstore_size[i], self.dimension))
+                    keys = keys_from_memmap[:].astype(np.float16)
+
+                vals_from_memmap = np.memmap(f'{keys_vals_prefix}_vals.npy', dtype=np.int32, mode='r',
+                                            shape=(self.dstore_size[i], 1))
+                vals = torch.from_numpy(vals_from_memmap[:]).long().to(self.device)
+                logger.info('Loading to memory took {} s'.format(time.time() - start))
+
+            cpu_indexes.append(cpu_index)
+            gpu_indexes.append(gpu_index)
+            all_vals.append(vals)
+            all_keys.append(keys)
+
+        # return single objects if not gated
+        if self.is_gated:
+            return cpu_indexes, gpu_indexes, all_vals, all_keys
+        else:
+            return cpu_indexes[0], gpu_indexes[0], all_vals[0], all_keys[0]
 
     def register(self, model):
         self.model = model
-        self.reconstruct_index, self.index = self.setup_faiss()
+        self.reconstruct_index, self.index, self.vals, self.keys = self.setup_faiss()
 
     def process(self, hidden_states, am_logits):
         '''
@@ -159,25 +180,49 @@ class KNNWrapper_for_ctc(object):
 
         # vocab should be assigned once
         self.vocab_size = am_logits.shape[-1]
-        dists, knns = self.get_knns(queries)  # (batch, time, k)
+        if self.is_gated:
+            res_dists, res_knns = self.get_knns(queries)  # list of (batch, time, k)
+
+            # distance comparison for gating
+            avg_dists_zh = res_dists[0][:, :self.n].mean(dim=-1)
+            avg_dists_en = res_dists[1][:, :self.n].mean(dim=-1)
+            is_zh = (avg_dists_zh <= avg_dists_en).unsqueeze(-1)
+
+            dists = torch.where(is_zh, res_dists[0], res_dists[1])
+            knns = torch.where(is_zh, res_knns[0], res_knns[1])
+
+            v_zh = self.vals[0][res_knns[0]].squeeze(-1)
+            v_en = self.vals[1][res_knns[1]].squeeze(-1)
+
+            vals_at_knns = torch.where(is_zh, v_zh, v_en)
+        else:
+            dists, knns = self.get_knns(queries)  # (batch, time, k)
+            is_zh=None
+            vals_at_knns = self.vals[knns].squeeze(-1)
 
         if self.recompute_dists:
-            knns_vecs = torch.from_numpy(self.keys[knns]).to(self.device)
+            if self.is_gated:
+                k_cn = torch.from_numpy(self.keys[0][res_knns[0]]).to(self.device)
+                k_en = torch.from_numpy(self.keys[1][res_knns[1]]).to(self.device)
+                knns_vecs = torch.where(is_zh.unsqueeze(-1), k_cn, k_en)
+            else:
+                knns_vecs = torch.from_numpy(self.keys[knns]).to(self.device)
             dists = self.dist_func(queries, knns_vecs)
 
         neg_dists = -dists
-        knn_log_probs, vals_at_knns = self.knns_to_log_prob(knns, neg_dists)
+        knn_log_probs, _ = self.knns_to_log_prob(knns, neg_dists, precomputed_vals=vals_at_knns)
 
         # Time*Vocab -> 1*Time*Vocab
         knn_log_probs = torch.unsqueeze(knn_log_probs, dim=0)
-        
+    
         if self.scale_lmbda:
             lmbda = self.dynamic_scale_lmbda(dists)
+            # not support gated version
             interpolated_scores = KNNWrapper_for_ctc.scale_lmbda_interpolate(knn_log_probs, am_logits, 
                                                                 lmbda, self.decode_skip_blank)
         else:
-            interpolated_scores = KNNWrapper_for_ctc.interpolate(knn_log_probs, am_logits, 
-                                                         self.lmbda, self.decode_skip_blank)  # (nonpad, vocab)
+            interpolated_scores = self.interpolate(knn_log_probs, am_logits, 
+                                                        self.lmbda, self.decode_skip_blank, is_zh)  # (nonpad, vocab)
         
         return interpolated_scores, dists, vals_at_knns
 
@@ -213,14 +258,23 @@ class KNNWrapper_for_ctc(object):
         '''
         if not self.knn_gpu:
             queries = queries.cpu()
-        dists, knns = self.index.search(torch.squeeze(queries, 0), self.k)  # queries (batch*times, vocab)
-        dists, knns = dists.to(self.device), knns.to(self.device)
-        return dists, knns
 
-    def knns_to_log_prob(self, knns, neg_dists):
+        if self.is_gated:
+            dists_list, knns_list = [], []
+            for idx in self.index:
+                dists, knns = idx.search(torch.squeeze(queries, 0), self.k)  # queries (batch*times, vocab)
+                dists_list.append(torch.from_numpy(dists).to(self.device) if isinstance(dists, np.ndarray) else dists.to(self.device))
+                knns_list.append(torch.from_numpy(knns).to(self.device) if isinstance(knns, np.ndarray) else knns.to(self.device))
+            return dists_list, knns_list
+        else:
+            dists, knns = self.index.search(torch.squeeze(queries, 0), self.k)  # queries (batch*times, vocab)
+            dists, knns = dists.to(self.device), knns.to(self.device)
+            return dists, knns
+
+    def knns_to_log_prob(self, knns, neg_dists, precomputed_vals=None):
         probs = torch.nn.functional.softmax(neg_dists / self.knn_temperature, dim=-1)
         # when bz =1 , we use squeeze, but if bz > 1, it will go wrong
-        vals_at_knns = self.vals[knns].squeeze(-1)  # (nonpad batch * time, k)
+        vals_at_knns = precomputed_vals if precomputed_vals is not None else self.vals[knns].squeeze(-1)  # (nonpad batch * time, k)
 
         knn_log_probs = torch.full(size=(vals_at_knns.shape[:-1] + (self.vocab_size,)), fill_value=0.0).to(self.device) \
             .scatter_add(dim=-1, index=vals_at_knns, src=probs).log()  # (nonpad_batch * time, vocab)
@@ -241,9 +295,9 @@ class KNNWrapper_for_ctc(object):
         # returns: (batch, beams, time)
         return torch.sum((query.unsqueeze(-2) * keys), dim=-1)
 
-    @staticmethod
-    def interpolate(knn_log_probs, am_log_probs, lmbda, decode_skip_blank):
+    def interpolate(self, knn_log_probs, am_log_probs, lmbda, decode_skip_blank, is_zh):
         # if flag is true , skip the frames which ctc-pseudo label are null
+        log_t = np.log(self.t)
         if decode_skip_blank :
             am_logits = am_log_probs.squeeze()
             predicted_ids = torch.argmax(am_logits, dim=-1)
@@ -252,6 +306,15 @@ class KNNWrapper_for_ctc(object):
             interpolated[0, mask] = torch.logaddexp(am_log_probs[0, mask] + np.log(1 - lmbda), knn_log_probs[0, mask] + np.log(lmbda))
         else:
             interpolated = torch.logaddexp(am_log_probs + np.log(1 - lmbda), knn_log_probs + np.log(lmbda))
+
+        if self.is_gated:
+            mask_zh_frames = is_zh.unsqueeze(0).int()
+
+            # penalize English in Chinese frames
+            interpolated[:, :, self.en_indices] -= log_t * mask_zh_frames
+            # penalize Chinese in English frames
+            interpolated[:, :, self.zh_indices] -= log_t * (1 - mask_zh_frames)
+
         return interpolated
 
 
